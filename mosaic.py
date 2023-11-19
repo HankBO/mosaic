@@ -11,7 +11,7 @@ import random
 from dataclasses import dataclass
 from itertools import compress, product
 from pathlib import Path
-from typing import Callable, Generator
+from typing import Callable, Generator, Set
 
 ## 1. Mosaic system calls
 
@@ -25,6 +25,10 @@ sys_sched = lambda: os.sys_sched()
 
 sys_choose = lambda choices: os.sys_choose(choices)
 sys_write = lambda *args: os.sys_write(*args)
+
+### Shared memory
+sys_shmget = lambda key: os.sys_shmget(key)
+sys_shmat = lambda shmid: os.sys_shmat(shmid)
 
 ### 1.3 Virtual block storage device
 
@@ -48,10 +52,21 @@ def syscall(func):  # @syscall decorator
 class Heap:
     pass  # no member: self.__dict__ is the heap
 
+### shared memory heap: shm_heap.__dict__ {shm_id: dict(), ...}
+shm_heaps = {}
+
+## 4. Utilities
+
+def set_default(obj):
+    if 'Heap' in str(type(obj)):
+        return obj.__dict__
+    raise TypeError
+
 @dataclass
 class Thread:
     context: Generator  # program counter, local variables, etc.
     heap: Heap  # a pointer to thread's "memory"
+    shmids: Set  #  shared memory segement ids attached
 
 @dataclass
 class Storage:
@@ -167,7 +182,7 @@ class OperatingSystem:
     def __init__(self, init: Callable):
         """Create a new OS instance with pending-to-execute init thread."""
         # Operating system states
-        self._threads = [Thread(context=init(), heap=Heap())]
+        self._threads = [Thread(context=init(), heap=Heap(), shmids=set())]
         self._current = 0
         self._choices = {init.__name__: lambda: None}
         self._stdout = ''
@@ -190,6 +205,7 @@ class OperatingSystem:
                 Thread(
                     context=func(*args),  # func() returns a new generator
                     heap=self.current().heap,  # shared heap
+                    shmids=set(),
                 )
             )
         return {'spawn': (lambda: do_spawn())}
@@ -244,6 +260,29 @@ class OperatingSystem:
         def do_write():
             self._stdout += ' '.join(str(arg) for arg in args)
         return {'write': (lambda: do_write())}
+
+### HaiBo's test: add a sys call shmget() & shmat()
+
+    @syscall
+    def sys_shmget(self, key: int):
+        """Create a shared memory segment(dict) in global env & return an shmid"""
+        def do_shmget():
+            if key not in shm_heaps:
+                globals()['shm_heaps'][key] = Heap()
+            return key
+        return {'shmget': (lambda: do_shmget())}
+    
+    @syscall
+    def sys_shmat(self, shmid: int):
+        """Attach a shm segment identified by shm_id to a thread's address space"""
+        def do_shmat():
+            if shmid not in globals()['shm_heaps']:
+                return -1
+            else:
+                self.current().shmids.add(shmid)
+                return id(globals()['shm_heaps'][shmid])
+        return {'shmat': (lambda: do_shmat())}
+        
 
 ### 2.3.3 Virtual block storage device
 
@@ -347,12 +386,16 @@ class OperatingSystem:
                 heaps[id(th.heap)]: th.heap.__dict__
                     for th in self._threads
             },
+            'shm_heaps': {
+                1+index: globals()['shm_heaps'][shmid].__dict__
+                    for index, shmid in enumerate(globals()['shm_heaps'])
+            },
             'stdout': self._stdout,
             'store_persist': self._storage.persist,
             'store_buffer': self._storage.buf,
         }
-
-        h = hash(json.dumps(os_state, sort_keys=True)) + 2**63
+        #print(os_state)
+        h = hash(json.dumps(os_state, sort_keys=True, default=set_default)) + 2**63
         return (copy.deepcopy(os_state)  # freeze the runtime state
                 | dict(hashcode=f'{h:016x}'))
 
@@ -470,7 +513,6 @@ class Mosaic:
         self.src = src
         self.entry = context['main']  # must have a main()
 
-## 4. Utilities
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -497,4 +539,4 @@ if __name__ == '__main__':
     #   mosaic --run foo.py | grep stdout | tail -n 1  # quick and dirty check
     #   mosaic --check bar.py | fx  # or any other interactive visualizer
     #
-    print(json.dumps(explored, ensure_ascii=False, indent=2))
+    print(json.dumps(explored, ensure_ascii=False, indent=2, default=set_default))
